@@ -15,17 +15,23 @@ keywords    = [
 ]
 
 [dependencies]
-imgui = "0.11"
 log   = "0.4"
+winit = { version = "0.30", features = ["x11", "mint"] }
+imgui-glium-renderer = { version = "0.12.0" }
+imgui-winit-support = { version = "0.12.0" }
+glium = { version = "0.34.0", default-features = true }
+image = { version = "0.23", optional = true }
+imgui = { version = "0.12.0", features = ["tables-api"] }
+copypasta = { version = "0.10.1" }
 
 [dev-dependencies]
-env_logger          = "0.10"
+env_logger          = "0.11.5"
 error-iter          = "0.4"
-imgui               = "0.11"
-imgui-winit-support = "0.11"
-pixels              = "0.12.1"
-winit               = "0.27"
-winit_input_helper  = "0.13"
+imgui               = "0.12.0"
+imgui-winit-support = "0.12.0"
+pixels              = "0.13.0"
+winit               = "0.30"
+winit_input_helper  = "0.16.0"
 
 [dev-dependencies.imgui-wgpu]
 git = "https://github.com/Yatekii/imgui-wgpu-rs.git"

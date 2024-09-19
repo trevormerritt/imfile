@@ -1,210 +1,175 @@
-use pixels::{wgpu, PixelsContext};
-use std::process::abort;
+use std::fs::File;
+use glium::glutin::surface::WindowSurface;
+use glium::{Display, Surface};
+use imgui::{Condition, Context, FontConfig, FontGlyphRanges, FontSource, Ui};
+use imgui_glium_renderer::Renderer;
+use imgui_winit_support::winit::event::{Event, WindowEvent};
+use imgui_winit_support::winit::event_loop::EventLoop;
+use imgui_winit_support::winit::window::WindowBuilder;
+use imgui_winit_support::{HiDpiMode, WinitPlatform};
+use std::path::Path;
 use std::time::Instant;
-use pixels::{Error, Pixels, SurfaceTexture};
-use winit::dpi::LogicalSize;
-use winit::event::{Event, VirtualKeyCode};
-use winit::event_loop::{ControlFlow, EventLoop};
-use winit::window::WindowBuilder;
-use winit_input_helper::WinitInputHelper;
 
-pub(crate) struct Gui {
-    imgui: imgui::Context,
-    platform: imgui_winit_support::WinitPlatform,
-    renderer: imgui_wgpu::Renderer,
-    last_frame: Instant,
-    last_cursor: Option<imgui::MouseCursor>,
-    open_file_dialog: bool,
+use copypasta::{ClipboardContext, ClipboardProvider};
+use imgui::ClipboardBackend;
+use imfile::FileDialog;
+
+pub const FONT_SIZE: f32 = 13.0;
+
+pub fn init() -> Option<ClipboardSupport> {
+    ClipboardContext::new().ok().map(ClipboardSupport)
 }
 
-impl Gui {
-    /// Create Dear ImGui.
-    pub(crate) fn new(window: &winit::window::Window, pixels: &pixels::Pixels) -> Self {
-        // Create Dear ImGui context
-        let mut imgui = imgui::Context::create();
-        imgui.set_ini_filename(None);
+pub struct ClipboardSupport(pub ClipboardContext);
 
-        // Initialize winit platform support
-        let mut platform = imgui_winit_support::WinitPlatform::init(&mut imgui);
-        platform.attach_window(
-            imgui.io_mut(),
-            window,
-            imgui_winit_support::HiDpiMode::Default,
-        );
+pub fn clipboard_init() -> Option<ClipboardSupport> {
+    ClipboardContext::new().ok().map(ClipboardSupport)
+}
 
-        // Configure Dear ImGui fonts
-        let hidpi_factor = window.scale_factor();
-        let font_size = (13.0 * hidpi_factor) as f32;
-        imgui.io_mut().font_global_scale = (1.0 / hidpi_factor) as f32;
-        imgui
-            .fonts()
-            .add_font(&[imgui::FontSource::DefaultFontData {
-                config: Some(imgui::FontConfig {
-                    oversample_h: 1,
-                    pixel_snap_h: true,
-                    size_pixels: font_size,
-                    ..Default::default()
-                }),
-            }]);
+impl ClipboardBackend for ClipboardSupport {
+    fn get(&mut self) -> Option<String> {
+        self.0.get_contents().ok()
+    }
+    fn set(&mut self, text: &str) {
+        // ignore errors?
+        let _ = self.0.set_contents(text.to_owned());
+    }
+}
 
-        // Create Dear ImGui WGPU renderer
-        let device = pixels.device();
-        let queue = pixels.queue();
-        let config = imgui_wgpu::RendererConfig {
-            texture_format: pixels.render_texture_format(),
-            ..Default::default()
+
+
+#[allow(dead_code)] // annoyingly, RA yells that this is unusued
+pub fn simple_init<F: FnMut(&mut bool, &mut Ui) + 'static>(title: &str, run_ui: F) {
+    init_with_startup(title, |_, _, _| {}, run_ui);
+}
+
+pub fn init_with_startup<FInit, FUi>(title: &str, mut startup: FInit, mut run_ui: FUi)
+    where
+        FInit: FnMut(&mut Context, &mut Renderer, &Display<WindowSurface>) + 'static,
+        FUi: FnMut(&mut bool, &mut Ui) + 'static,
+{
+    let mut imgui = create_context();
+
+    let title = match Path::new(&title).file_name() {
+        Some(file_name) => file_name.to_str().unwrap(),
+        None => title,
+    };
+    let event_loop = EventLoop::new().expect("Failed to create EventLoop");
+
+    let builder = WindowBuilder::new()
+        .with_maximized(false)
+        .with_title(title);
+    //  .with_inner_size(LogicalSize::new(1024, 768));
+    let (window, display) = glium::backend::glutin::SimpleWindowBuilder::new()
+        .set_window_builder(builder)
+        .build(&event_loop);
+    let mut renderer = Renderer::init(&mut imgui, &display).expect("Failed to initialize renderer");
+
+    if let Some(backend) = clipboard_init() {
+        imgui.set_clipboard_backend(backend);
+    } else {
+        eprintln!("Failed to initialize clipboard");
+    }
+
+    let mut platform = WinitPlatform::init(&mut imgui);
+    {
+        let dpi_mode = if let Ok(factor) = std::env::var("IMGUI_EXAMPLE_FORCE_DPI_FACTOR") {
+            // Allow forcing of HiDPI factor for debugging purposes
+            match factor.parse::<f64>() {
+                Ok(f) => HiDpiMode::Locked(f),
+                Err(e) => panic!("Invalid scaling factor: {}", e),
+            }
+        } else {
+            HiDpiMode::Default
         };
-        let renderer = imgui_wgpu::Renderer::new(&mut imgui, device, queue, config);
 
-        // Return GUI context
-        Self {
-            open_file_dialog: true,
-            imgui,
-            platform,
-            renderer,
-            last_frame: Instant::now(),
-            last_cursor: None,
-        }
+        platform.attach_window(imgui.io_mut(), &window, dpi_mode);
     }
 
-    /// Prepare Dear ImGui.
-    pub(crate) fn prepare(
-        &mut self,
-        window: &winit::window::Window,
-    ) -> Result<(), winit::error::ExternalError> {
-        // Prepare Dear ImGui
-        let now = Instant::now();
-        self.imgui.io_mut().update_delta_time(now - self.last_frame);
-        self.last_frame = now;
-        self.platform.prepare_frame(self.imgui.io_mut(), window)
-    }
+    let mut last_frame = Instant::now();
 
-    /// Render Dear ImGui.
-    pub(crate) fn render(
-        &mut self,
-        window: &winit::window::Window,
-        encoder: &mut wgpu::CommandEncoder,
-        render_target: &wgpu::TextureView,
-        context: &PixelsContext,
-    ) -> imgui_wgpu::RendererResult<()> {
-        // Start a new Dear ImGui frame and update the cursor
-        let ui = self.imgui.new_frame();
+    startup(&mut imgui, &mut renderer, &display);
 
-        let mouse_cursor = ui.mouse_cursor();
-        if self.last_cursor != mouse_cursor {
-            self.last_cursor = mouse_cursor;
-            self.platform.prepare_render(ui, window);
-        }
-
-        if self.open_file_dialog == true {
-            if let Some(file) = imfile::FileDialog::new()
-                .accept_text("Open file")
-                .for_save()
-                .cancel_text("Close")
-                .title("Open File")
-                .spawn(&ui)
-            {
-                println!("Filename: {}", file.display());
-                self.open_file_dialog = false;
+    event_loop
+        .run(move |event, window_target| match event {
+            Event::NewEvents(_) => {
+                let now = Instant::now();
+                imgui.io_mut().update_delta_time(now - last_frame);
+                last_frame = now;
             }
-        }
+            Event::AboutToWait => {
+                platform
+                    .prepare_frame(imgui.io_mut(), &window)
+                    .expect("Failed to prepare frame");
+                window.request_redraw();
+            }
+            Event::WindowEvent {
+                event: WindowEvent::RedrawRequested,
+                ..
+            } => {
+                let ui = imgui.frame();
 
-        // Render Dear ImGui with WGPU
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("imgui"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: render_target,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: true,
-                },
-            })],
-            depth_stencil_attachment: None,
-        });
+                let mut run = true;
+                run_ui(&mut run, ui);
+                if !run {
+                    window_target.exit();
+                }
 
-        self.renderer.render(
-            self.imgui.render(),
-            &context.queue,
-            &context.device,
-            &mut rpass,
-        )
-    }
-
-    /// Handle any outstanding events.
-    pub(crate) fn handle_event(
-        &mut self,
-        window: &winit::window::Window,
-        event: &winit::event::Event<()>,
-    ) {
-        self.platform
-            .handle_event(self.imgui.io_mut(), window, event);
-    }
+                let mut target = display.draw();
+                target.clear_color_srgb(1.0, 1.0, 1.0, 1.0);
+                platform.prepare_render(ui, &window);
+                let draw_data = imgui.render();
+                renderer
+                    .render(&mut target, draw_data)
+                    .expect("Rendering failed");
+                target.finish().expect("Failed to swap buffers");
+            }
+            Event::WindowEvent {
+                event: WindowEvent::Resized(new_size),
+                ..
+            } => {
+                if new_size.width > 0 && new_size.height > 0 {
+                    display.resize((new_size.width, new_size.height));
+                }
+                platform.handle_event(imgui.io_mut(), &window, &event);
+            }
+            Event::WindowEvent {
+                event: WindowEvent::CloseRequested,
+                ..
+            } => window_target.exit(),
+            event => {
+                platform.handle_event(imgui.io_mut(), &window, &event);
+            }
+        })
+        .expect("EventLoop error");
 }
 
-fn main() -> Result<(), Error> {
-    env_logger::init();
-    let event_loop = EventLoop::new();
-    let mut input = WinitInputHelper::new();
-    let window = {
-        let size = LogicalSize::new(1280 as f64, 720 as f64);
-        WindowBuilder::new()
-            .with_title("ImFile example")
-            .with_inner_size(size)
-            .with_min_inner_size(size)
-            .build(&event_loop)
-            .unwrap()
-    };
+/// Creates the imgui context
+pub fn create_context() -> imgui::Context {
+    let mut imgui = Context::create();
+    imgui.set_ini_filename(None);
+    imgui
+}
 
-    let mut scale_factor = window.scale_factor();
+fn main() {
+    let mut need_dialog = true;
 
-    let mut pixels = {
-        let window_size = window.inner_size();
-        let surface_texture = SurfaceTexture::new(window_size.width, window_size.height, &window);
-        Pixels::new(1280, 720, surface_texture)?
-    };
-    
-    let mut gui = Gui::new(&window, &pixels);
-
-    event_loop.run(move |event, _, control_flow| {
-        // Draw the current frame
-        if let Event::RedrawRequested(_) = event {
-            pixels.frame_mut().into_iter().for_each(|pix| *pix = 0x0);
-            gui.prepare(&window).expect("gui.prepare() failed");
-            let render_result = pixels.render_with(|encoder, render_target, context| {
-                context.scaling_renderer.render(encoder, render_target);
-                gui.render(&window, encoder, render_target, context)?;
-
-                Ok(())
-            });
-            if render_result.is_err() {
-                log::error!("Can't render!");
-                abort();
-            }
-        }
-
-        gui.handle_event(&window, &event);
-        if input.update(&event) {
-            if input.key_pressed(VirtualKeyCode::Escape) || input.quit() {
-                *control_flow = ControlFlow::Exit;
-                return;
-            }
-
-            if let Some(factor) = input.scale_factor() {
-                scale_factor = factor;
-            }
-
-            if let Some(size) = input.window_resized() {
-                if size.width > 0 && size.height > 0 {
-                    pixels.resize_surface(size.width, size.height).expect("resize error");
-
-                    let LogicalSize { width, height } = size.to_logical(scale_factor);
-                    if let Err(err) = pixels.resize_buffer(width, height) {
-                        panic!("Error: {err}");
+    simple_init("GuiFileSlicer", move |_, ui| {
+        let dialog = FileDialog::new();
+        ui.window("My Window")
+            .size(ui.io().display_size, Condition::Always)
+            .no_decoration()
+            .position([0.0, 0.0], Condition::Always)
+            .build( || {
+                if need_dialog {
+                    if let Some(file) = dialog.spawn(&ui) // Create the dialog using the imgui::Ui
+                    {
+                        println!("File chosen: {}", file.display());
+                        need_dialog = false;
+                    } else {
+                        // println!("No file selected.");
                     }
                 }
-            }
-            window.request_redraw();
-        }
-    });
+            });
+    })
 }
